@@ -40,7 +40,7 @@ use POSIX qw(strftime);		# strftime() is used by log()
 use Curses;
 
 use constant VERSION => '0.1';
-use constant HOME => 'https://www.w3.org/...';
+use constant HOME => 'https://github.com/w3c/zakim-monitor';
 use constant USAGE => "Usage: $0 [-v] [-n nick] [-N name] IRC-URL\n";
 
 
