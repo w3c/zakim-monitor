@@ -1,0 +1,609 @@
+#!/usr/bin/env perl						# -*-perl-*-
+#
+# An IRC client that connects to a channel, watches the interaction
+# with Zakim[1], and continuously displays on standard output the
+# agenda, speaker queue and question list that it believes Zakim
+# currently has. (If is gets out of sync, asking Zakim to display its
+# current queue on the channel, e.g., with "agenda?", gets it
+# synchronized again.)
+#
+# See the full manual at the end of this file. (Run "perldoc
+# zakim-monitor" to read a formatted version.)
+#
+# [1] https://www.w3.org/2001/12/zakim-irc-bot.html
+#
+#
+# Copyright © 2021 World Wide Web Consortium, (Massachusetts Institute
+# of Technology, European Research Consortium for Informatics and
+# Mathematics, Keio University, Beihang). All Rights Reserved. This
+# work is distributed under the W3C® Software and Document License[2]
+# in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE.
+#
+# [2] http://www.w3.org/Consortium/Legal/copyright-software
+#
+#
+# Author: Bert Bos <bert@w3.org>
+# Created: 13 September 2021
+
+package ZakimMonitor;
+use FindBin;
+use lib "$FindBin::Bin";
+use parent 'Bot::BasicBot::ExtendedBot';
+use strict;
+use warnings;
+use utf8;
+use Getopt::Std;
+use Term::ReadKey;		# To read a password without echoing
+use POSIX qw(strftime);		# strftime() is used by log()
+use Curses;
+
+use constant VERSION => '0.1';
+use constant HOME => 'https://www.w3.org/...';
+use constant USAGE => "Usage: $0 [-v] [-n nick] [-N name] IRC-URL\n";
+
+
+# init -- initialize some parameters
+sub init($)
+{
+  my $self = shift;
+
+  $self->clear_agenda();
+  $self->set_queue('');
+  $self->clear_questions();
+
+  initscr;			# Initialize the curses screen
+
+  return 1;
+}
+
+
+# DESTROY -- clean up when the oject is destroyed
+sub DESTROY
+{
+  endwin;			# Restore the screen
+}
+
+
+# log -- print a message to STDERR, but only if -v (verbose) was specified
+sub log
+{
+  my ($self, @messages) = @_;
+  my $now = strftime "%Y-%m-%dT%H:%M:%SZ", gmtime;
+
+  # Prefix all log lines with the current time.
+  $self->SUPER::log(map($now.' '.$_, @messages)) if $self->{'verbose'};
+}
+
+
+# addstr_hellip -- write text to the terminal, add … if it is truncated
+sub addstr_hellip($$$$$)
+{
+  my ($self, $y, $x, $text, $maxlen) = @_;
+
+  substr($text, $maxlen - 1) = '…' if length($text) > $maxlen;
+  addstring($y, $x, $text);
+}
+
+
+# output -- (re-)display a queue
+sub output($$)
+{
+  my ($self, $which) = @_;
+  my $y = 0;
+  my ($columns, $lines, $wpixels, $hpixels) = GetTerminalSize();
+  my $col2 = int($columns/2);
+  my $col3 = int(3 * $columns / 5);
+
+  # TODO: Can this be made more efficient by redrawing just the part
+  # indicated by $which?
+
+  # Clear the window.
+  erase();
+
+  # Draw the first column: the agenda.
+  $y = 0;
+  $self->addstr_hellip($y++, 0, "AGENDA", $col2);
+  $self->addstr_hellip($y++, 0, "------", $col2);
+  foreach my $i (@{$self->{'agenda_order'}}) {
+    if ($self->{'agenda_is_open'}[$i]) {
+      $self->addstr_hellip($y++, 0,
+	sprintf("%d. %s", $i, $self->{'agenda'}[$i]), $col2);
+    }
+  }
+
+  # Draw the second column: the speaker queue.
+  $y = 0;
+  $self->addstr_hellip($y++, $col2, " QUEUE", $col3 - $col2);
+  $self->addstr_hellip($y++, $col2, " -----", $col3 - $col2);
+  $self->addstr_hellip($y++, $col2, " $_", $col3 - $col2)
+      foreach @{$self->{'queue'}};
+
+  # Draw the third column: the list of questions.
+  my @score = [-1];	      # Number of supporters for each question
+  foreach (1 .. $#{$self->{'questions'}}) {
+    push @score,
+	!defined $self->{'questions'}[$_] ? -1 : # Dropped question
+	scalar %{$self->{'questions_supporters'}[$_]};
+  }
+  $y = 0;
+  $self->addstr_hellip($y++, $col3, " QUESTIONS", $columns - $col3);
+  $self->addstr_hellip($y++, $col3, " ---------", $columns - $col3);
+  my @order = sort {$score[$b] <=> $score[$a]} (1..$#{$self->{'questions'}});
+  foreach (@order) {		# Print in order, omit dropped questions
+    if ($score[$_] >= 0) {
+      $self->addstr_hellip($y++, $col3,
+	sprintf(" Q%d: %s (%d)",$_,$self->{'questions'}[$_],$score[$_]),
+	$columns - $col3);
+    }
+  }
+
+  # Update the terminal
+  refresh;
+}
+
+
+# add_agendum -- add an agenda item
+sub add_agendum($$)
+{
+  my ($self, $item) = @_;
+
+  push @{$self->{'agenda'}}, $item;
+  push @{$self->{'agenda_order'}}, $#{$self->{'agenda'}};
+  push @{$self->{'agenda_is_open'}}, 1;
+  $self->output('agenda');
+  return undef;
+}
+
+
+# change_agendum -- change agenda item n, called when a user changes it
+sub change_agendum($$$)
+{
+  my ($self, $n, $item) = @_;
+
+  if ($n >= 1 && $n <= $#{$self->{'agenda'}}) { # Only existing items
+    $self->{'agenda'}[$n] = $item;
+    $self->{'agenda_is_open'}[$n] = 1; # Reopen if it was already closed
+    $self->output('agenda');
+  }
+  return undef;
+}
+
+
+# set_agendum -- set agenda item n, called when Zakim reports an item
+sub set_agendum($$$)
+{
+  my ($self, $n, $item) = @_;
+
+  $self->{'agenda'}[$n] = $item;
+  $self->{'agenda_is_open'}[$n] = 1; # Reopen if it was already closed
+
+  # Create the item if we didn't know it before.
+  push @{$self->{'agenda_order'}}, $n
+      if !grep {$_ == $n} @{$self->{'agenda_order'}};
+
+  $self->output('agenda');
+  return undef;
+}
+
+
+# delete_agendum -- remove agenda item n (same as closing it)
+sub delete_agendum($$)
+{
+  my ($self, $n) = @_;
+
+  if ($n >= 1 && $n <= $#{$self->{'agenda'}}) { # Only existing items
+    $self->{'agenda_is_open'}[$n] = 0;
+    $self->output('agenda');
+  }
+  return undef;
+}
+
+
+# clear_agenda -- empty the agenda
+sub clear_agenda($)
+{
+  my ($self) = @_;
+
+  $self->{'agenda'} = ['unused agenda item 0'];
+  $self->{'agenda_order'} = [];    # List of numbers of agenda items
+  $self->{'agenda_is_open'} = [0]; # List of booleans, 0 means item is closed
+  $self->{'current_agendum'} = 0;  # Last opened agenda item, or 0 if none
+  $self->output('agenda');
+  return undef;
+}
+
+
+# set_current_agendum -- remember the number of the current agenda item
+sub set_current_agendum($$)
+{
+  my ($self, $n) = @_;
+
+  $self->delete_agendum($self->{'current_agendum'}); # Close current, if any
+  $self->{'current_agendum'} = $n;
+  $self->{'agenda_is_open'}[$n] = 1; # Zakim actually doesn't do this...
+  $self->output('agenda');
+  return undef;
+}
+
+
+# agenda_order -- change the order of the agenda items
+sub agenda_order($$)
+{
+  my ($self, $order) = @_;
+  my ($i, %r);
+
+  # Invert the agenda_order array.
+  $r{$self->{'agenda_order'}[$_]} = $_ foreach (0..$#{$self->{'agenda_order'}});
+
+  # TODO: When there are duplicate items in the order (e.g., "5 4 5"),
+  # this algorithm takes the last occurrence as the final position
+  # (i.e., 5 ends up after 4). But Zakim instead puts item 5 twice on
+  # the agenda and drops items from the end of the agenda to end up
+  # with the same number of items as before. We probably want Zakim to
+  # change, because dropping items is unexpected.
+  $i = 0;
+  while ($order =~ /(\d+(?:-(\d+))?)/g) {
+    my ($lo, $hi) = ($1, $2 // $1);
+    foreach my $n ($lo..$hi) {
+      if (1 <= $n && $n <= $#{$self->{'agenda'}}) {
+	# Swap items $i and $r{$n} in the agenda_order.
+	my $h = $self->{'agenda_order'}[$i];
+	$self->{'agenda_order'}[$i] = $n;
+	$self->{'agenda_order'}[$r{$n}] = $h;
+	$r{$h} = $r{$n};
+	$r{$n} = $i;
+	$i++;
+      }
+    }
+  }
+
+  $self->output('agenda');
+  return undef;
+}
+
+
+# set_queue -- reset the speaker queue to the given comma-separated list
+sub set_queue($$)
+{
+  my ($self, $names) = @_;
+
+  $self->{'queue'} = [];
+  push @{$self->{'queue'}}, split(/, /, $names);
+  $self->output('queue');
+  return undef;
+}
+
+
+# add_question -- add a question to the questions list
+sub add_question($$$)
+{
+  my ($self, $who, $question) = @_;
+
+  $question =~ s/^\s+//;	# Trim leading white space
+  $question =~ s/\s+$//;	# Trim trailing white space
+  push @{$self->{'questions'}}, $question;
+  push @{$self->{'questions_supporters'}}, {$who => 1};
+  $self->output('questions');
+  return undef;
+}
+
+
+# support_question -- add a person to the supporters of question n
+sub support_question($$$)
+{
+  my ($self, $who, $n) = @_;
+
+  $self->{'questions_supporters'}[$n]->{$who} = 1;
+  $self->output('questions');
+  return undef;
+}
+
+
+# unsupport_question -- remove a person from the supporters of question n
+sub unsupport_question($$$)
+{
+  my ($self, $who, $n) = @_;
+
+  delete $self->{'questions_supporters'}[$n]->{$who};
+  $self->output('questions');
+  return undef;
+}
+
+
+# drop_question -- remove question n from the list
+sub drop_question($$)
+{
+  my ($self, $n) = @_;
+
+  $self->{'questions'}[$n] = undef;
+  $self->{'questions_supporters'}[$n] = {};
+  $self->output('questions');
+  return undef;
+}
+
+
+# set_question -- update question n with this info from Zakim
+sub set_question($$$$)
+{
+  my ($self, $n, $question, $nsupporters) = @_;
+  my $score;
+
+  $self->{'questions'}[$n] = $question;
+
+  # We don't know who supports the question, so we cannot set the supporters.
+  $self->{'questions_supporters'}[$n] //= {};
+  $score = scalar %{$self->{'questions_supporters'}[$n]};
+  $self->log("Q$n has $score supporters; should be $nsupporters")
+      if $score != $nsupporters;
+
+  $self->output('questions');
+  return undef;
+}
+
+
+# clear_questions -- clear the list of questions
+sub clear_questions($)
+{
+  my ($self) = @_;
+
+  $self->{'questions'} = ['Unusued question 0'];
+  $self->{'questions_supporters'} = [{}];
+  $self->output('questions');
+  return undef;
+}
+
+
+# # chanjoin -- called when somebody joins a channel
+# sub chanjoin($$)
+# {
+#   my ($self, $info) = @_;
+#   my $who = $info->{'who'};
+#   my $channel = $info->{'channel'};
+#   # my $raw_nick = $info->{'raw_nick'};
+#   # my $body = $info->{'body'};
+#   # my $address = $info->{'address'};
+# }
+
+
+# help -- return the text in response to "zakim-monitor, help"
+sub help($$)
+{
+  my ($self, $info) = @_;
+
+  return "I'm an instance of " . $self->name." . I watch the conversation" .
+      " with Zakim in this channel and try to show the current agenda," .
+      " speaker queue and questions list outside of this IRC channel.";
+}
+
+
+# said -- handle a message
+sub said($$)
+{
+  my ($self, $info) = @_;
+  my $who = $info->{'who'};		# Who said something (nick)
+  my $text = $info->{'body'};		# What nick said
+  my $channel = $info->{'channel'};	# "#channel" or "msg"
+  # my $me = $self->nick();		# Our own name
+  # my $addressed = $info->{'address'};	# Defined if we're personally addressed
+
+  # We only handle channels we explicitly joined. We don't handle
+  # private messages (channel 'msg') or messages on other channels
+  # which we receive because we are connecting through a shared proxy.
+  return $self->SUPER::said($info) if !grep {$channel eq $_} $self->channels;
+
+  # Agenda management.
+
+  return $self->add_agendum("$1 [from $2 via $who]")
+      if $text =~ /^\s*(?:zakim,\s*)?agenda\+\s*(.*)\s+\[([^]]+)\]\s*$/i;
+
+  return $self->add_agendum("$1 [from $who]")
+      if $text =~ /^\s*(?:zakim,\s*)?agenda\+\s*(.*)/i;
+
+  return $self->change_agendum($1, "$2 [from $3 via $who]")
+      if $text =~ /^\s*(?:zakim,\s*)?(?:agend(?:a|um)|item)\s+(\d+)\s*=\s*(.*)\s+\[([^]]+)\]\s*$/i;
+
+  return $self->change_agendum($1, "$2 [from $who]")
+      if $text =~ /^\s*(?:zakim,\s*)?(?:agenda|agendum|item)\s+(\d+)\s*=\s*(.*)/i;
+
+  return $self->delete_agendum($1)
+      if $text =~ /^\s*(?:zakim,\s*)?
+      	 (?:agend(?:a|um)-
+    	 |(?:please\s+)?(?:delete|drop|forget|remove)\s+(?:agend(?:a|um)|item)
+    	 )\s*(\d+)\s*$/ix;
+	 # The manual also allows "item-", but Zakim doesn't actually do it.
+
+  return $self->agenda_order($1)
+      if $text =~ /^\s*(?:zakim,\s*)?(?:the\s+)?agenda\s+order\s+(?:is\s+)?([-,\s\d]+)$/i;
+
+  return $self->set_agendum($1, "$2 $3") // $self->set_current_agendum($1)
+      if $who =~ /^zakim$/i &&
+         $text =~ /^(?:thinks )?agendum (\d+) -- (.*) -- taken up (\[from .*\])$/;
+
+  return $self->clear_agenda()
+      if $who =~ /^zakim$/i &&
+         $text =~ /^(?:notes )?agenda cleared$/;
+
+  return $self->set_agendum($1, $2)
+      if $who =~ /^zakim$/i &&
+         $text =~ /^(\d+)\. (.*)$/;
+
+  # Speaker queue (floor control).
+
+  return $self->set_queue('')
+      if $who =~ /^zakim$/i &&
+         $text =~ /^(?:I see|sees) no one on the speaker queue$/;
+
+  return $self->set_queue($1)
+      if $who =~ /^zakim$/i &&
+         $text =~ /^(?:I see|sees) (.*) on the speaker queue$/;
+
+  # Question tracking.
+
+  return $self->add_question($who, $1)
+      if $text =~ /^\s*ques(?:tion|t)?\s*\+([^+].*)/i;
+
+  return $self->support_question($who, $1 // $2)
+      if $text =~ /^\s*ques(?:tion|t)?\s*(?:\+\+\s*(\d+)|(\d+)\s*\+\+)\s*$/i;
+
+  return $self->unsupport_question($who, $1 // $2)
+      if $text =~ /^\s*ques(?:tion|t)?\s*(?:--\s*(\d+)|(\d+)\s*--)\s*$/i;
+
+  return $self->clear_questions()
+      if $who =~ /^zakim$/i &&
+         $text =~ /^(?:notes\ )?questions\ cleared$
+	 |^(?:I\ see|sees)\ no\ questions$/x;
+
+  return $self->drop_question($1)
+      if $who =~ /^zakim$/i &&
+         $text =~ /^(?:notes )?question (\d+).* dropped$/;
+
+  return $self->set_question($1, $2, $3)
+      if $who =~ /^zakim$/i &&
+      $text =~ /^Q(\d+): (.*) \((\d+) supporters?\)$/;
+
+  $self->log("<$who> $text");
+  return $self->SUPER::said($info);
+}
+
+
+# Main body
+
+my (%opts, $user, $password, $ssl, $host, $port, $channel, $nick, $name);
+
+getopts('n:N:v', \%opts) or die USAGE;
+die USAGE if $#ARGV != 0;
+
+# The single argument must be an IRC-URL.
+#
+$ARGV[0] =~ m/^(ircs?):\/\/(?:([^:]+):([^@]+)?@)?([^:\/#?]+)(?::([^\/]*))?(?:\/(.*))?$/i or
+    die "Argument must be a URI starting with `irc:' or `ircs:'\n";
+$ssl = $1 eq 'ircs';
+$user = $2 =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/egr if defined $2;
+$password = $3 =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/egr if defined $3;
+$host = $4;
+$port = $5 // ($ssl ? 6697 : 6667);
+$channel = $6 =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/egr if defined $6;
+$channel = '#' . $channel if defined $channel && $channel !~ /^[#&]/;
+
+$nick = $opts{'n'} // ($user ? "$user-zakim-monitor" : "zakim-monitor");
+$name = $opts{'N'} // ('Zakim Monitor '.VERSION.' ('.HOME.')');
+
+if (defined $user && !defined $password) {
+  print "IRC password for user \"$user\": ";
+  ReadMode('noecho');
+  $password = ReadLine(0);
+  ReadMode('restore');
+  print "\n";
+}
+
+my $bot = ZakimMonitor->new(
+  server => $host,
+  port => $port,
+  ssl => $ssl,
+  charset => 'utf8',
+  username => $user,
+  password => $password,
+  nick => $nick,
+  name => $name,
+  channels => (defined $channel ? [$channel] : []),
+  verbose => defined $opts{'v'});
+
+$bot->run();
+
+
+=head1 NAME
+
+zakim-monitor [-v] [-n I<nick>] [-N I<name>] I<IRC-URL>
+
+=head1 DESCRIPTION
+
+Zakim-monitor is an IRC client that connects to an IRC channel
+(specified by the URL) and watches for conversations involving Zakim.
+It tries to build the same agenda, speaker queue and questions list
+that Zakim does and show it in the terminal it is running in. (I.e.,
+I<not> in the IRC channel. The terminal is updated whenever the
+agenda, queue or questions are changed in the IRC channel.
+
+The I<IRC-URL> is of the form
+"ircs://I<user>:I<password>@I<server>/I<channel>" (for an
+SSL-encrypted connection to the given I<server>) or the same starting
+with "irc:" (for an unencrypted connection).
+
+When the I<password> is empty, B<zakim-monitor> will prompt for it and
+read it from standard input without echoing it to the terminal. (This
+is a way to avoid that the password is visible in the terminal or is
+stored in the command history.) E.g.:
+
+ zakim-monitor ircs://joe:@irc.example.org/meeting
+
+The I<channel> may start with "#" or "&". If omitted, "#" is assumed.
+(In other words, a URL like C<ircs://joe:pass@irc.example.org/meeting>
+is equivalent to C<ircs://joe:pass@irc.example.org/#meeting>
+
+Note: If you have a shared IRC proxy such as bip, you can connect
+B<zakim-monitor> to it, so that it does not show up as an additional
+user in the channel. E.g., if bip is listening on port 57344 on
+localhost, a command similar to this connects B<zakim-monitor> to it:
+C<zakim-monitor irc://user:user:passw:conn@localhost:57344/bb-test>
+
+There is no command to stop B<zakim-monitor> once it is running. Just
+kill the process, e.g., with Ctrl-C.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-v>
+
+Be verbose. B<zakim-monitor> prints some messages about what it is
+doing on standard error output. It is best to redirect standard error
+output in this case, otherwise the messages will interfere with the
+display of the agenda and queues in the terminal.
+
+=item B<-n> I<nick>
+
+By default, B<zakim-monitor> sets its nickname to
+"I<user>-zakim-monitor", where I<user> is the username it uses to
+authenticate to the IRC server (as given in the URL). Or just
+"zakim-monitor" is no username is given. The option B<-n> allows to
+set a different nickname.
+
+=item B<-N> I<name>
+
+By default, B<zakim-monitor> sets its "real name" to a text consisting
+of "Zakim Monitor", a version number and the URL of its online manual.
+The B<-N> option allows to set a different name.
+
+=back
+
+=head1 BUGS
+
+When B<zakim-monitor> joins a channel on which Zakim is already
+running, it may be that Zakim has already collected agenda items,
+speakers and questions. You can type commands to Zakim in the channel
+and B<zakim-monitor> will update itself from Zakim's responses: Type
+C<agenda?> to let Zakim print its current agenda, C<q?> to let it
+print its current speaker queue, and C<questions?> to let it print its
+current list of questions.
+
+However, Zakim has no way to show the list of people who "support" a
+question. Thus, B<zakim-monitor> will learn from C<questions?> what
+the questions are, but will not know the list of supporters and may
+show the questions in a different order than Zakim does.
+
+=head1 NOTES
+
+This was a 2021 Geek Week project.
+
+=head1 AUTHOR
+
+Bert Bos E<lt>bert@w3.org>
+
+=head1 SEE ALSO
+
+L<Zakim|https://www.w3.org/2001/12/zakim-irc-bot.html>,
+
+=cut
+

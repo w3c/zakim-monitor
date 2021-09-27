@@ -1,0 +1,26 @@
+TODO: Do nothing if Zakim isn't on the channel? I.e., check if Zakim
+is actually present and watch for it joining an leaving.
+
+TODO: Zakim may currently be ignoring the agenda ("zakim, ignore
+agenda"), in which case we should not react to "agenda+" and "agenda N
+=" either.
+
+TODO: When Zakim says "agendum X taken up", that doesn't always mean
+that the previously open item is removed. It is only removed if it was
+opened more than a minute ago, according to Zakim's clock...
+
+TODO: Support /invite to join a given channel and monitor more than
+one channel at a time?
+
+TODO: Ask Zakim for the current queues when joining a channel?
+
+TODO: Instead of sorting the questions each time they are printed on
+the terminal, keep them sorted? support_question() and
+unsupport_question() could move the question up or down in a list of
+indexes when it has more or fewer supporters than its neighbours in
+the list.
+
+TODO: Nicer output. Support graphical output as well as curses.
+Interact with the output, e.g., to scroll to hidden text, stop the
+program, or ask it to synchronize itself with Zakim by explicitly
+sending it commands on IRC, such as "agenda?".
