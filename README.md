@@ -1,6 +1,10 @@
 # zakim-monitor
 A program that watches [Zakim](https://www.w3.org/2001/12/zakim-irc-bot.html) in an IRC channel and shows a live view of Zakim's current agenda, queue and questions.
 
+Screenshot:
+
+<img alt="Screenshot of zakim-monitor running in an xterm" src="screenshot-curses.png" style="width: 496px">
+
 Run it with a command such as this:
 
     perl zakim-monitor ircs://mylogin:mypassword@irc.w3.org/channelname
