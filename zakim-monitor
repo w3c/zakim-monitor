@@ -35,7 +35,7 @@ use strict;
 use warnings;
 use utf8;
 use Getopt::Std;
-use Term::ReadKey;		# To read a password without echoing
+use Term::ReadKey;		# read without echoing; GetTerminalSize
 use POSIX qw(strftime);		# strftime() is used by log()
 use Curses;
 
@@ -48,12 +48,19 @@ use constant USAGE => "Usage: $0 [-v] [-n nick] [-N name] IRC-URL\n";
 sub init($)
 {
   my $self = shift;
+  my ($columns, $lines);
 
   $self->clear_agenda();
   $self->set_queue('');
   $self->clear_questions();
 
   initscr;			# Initialize the curses screen
+
+  $ENV{'COLUMNS'} = 0;		# Don't rely on environment variables
+  $ENV{'LINES'} = 0;
+  ($columns, $lines, undef, undef) = GetTerminalSize();
+  $self->{'columns'} = $columns;
+  $self->{'lines'} = $lines;
 
   return 1;
 }
@@ -91,10 +98,17 @@ sub addstr_hellip($$$$$)
 sub output($$)
 {
   my ($self, $which) = @_;
-  my $y = 0;
-  my ($columns, $lines, $wpixels, $hpixels) = GetTerminalSize();
-  my $col2 = int($columns/2);
-  my $col3 = int(3 * $columns / 5);
+  my ($y, $col2, $col3, $columns, $lines);
+
+  # Calculate the size of the columns.
+  ($columns, $lines, undef, undef) = GetTerminalSize();
+  if ($self->{'columns'} != $columns || $self->{'lines'} != $lines) {
+    $self->{'columns'} = $columns;
+    $self->{'lines'} = $lines;
+    resizeterm($lines, $columns); # Tell curses to update its data structures
+  }
+  $col2 = int($columns/2);
+  $col3 = int(3 * $columns / 5);
 
   # TODO: Can this be made more efficient by redrawing just the part
   # indicated by $which?
@@ -463,7 +477,7 @@ sub said($$)
       if $who =~ /^zakim$/i &&
       $text =~ /^Q(\d+): (.*) \((\d+) supporters?\)$/;
 
-  $self->log("<$who> $text");
+  # $self->log("<$who> $text");
   return $self->SUPER::said($info);
 }
 
@@ -592,6 +606,11 @@ However, Zakim has no way to show the list of people who "support" a
 question. Thus, B<zakim-monitor> will learn from C<questions?> what
 the questions are, but will not know the list of supporters and may
 show the questions in a different order than Zakim does.
+
+When the terminal size changes, B<zakim-monitor> does not immediately
+redraw the screen. It only redraws the screen when there is new
+information on the IRC channel. Thus, to update the screen, it may be
+necessary to type a command in IRC such as C<q?>.
 
 =head1 NOTES
 
