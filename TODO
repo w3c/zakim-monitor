@@ -24,3 +24,5 @@ TODO: Nicer output. Support graphical output as well as curses.
 Interact with the output, e.g., to scroll to hidden text, stop the
 program, or ask it to synchronize itself with Zakim by explicitly
 sending it commands on IRC, such as "agenda?".
+
+TODO: Redraw when the screen size changes. (Listen for WINCH signals.)
