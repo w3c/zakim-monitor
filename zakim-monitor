@@ -28,12 +28,20 @@
 # Created: 13 September 2021
 
 package ZakimMonitor;
+
+# BEGIN {
+#   package POE::Kernel;
+#   use constant ASSERT_DEFAULT => 1;
+# }
+
 use FindBin;
 use lib "$FindBin::Bin";
 use parent 'Bot::BasicBot::ExtendedBot';
 use strict;
 use warnings;
 use utf8;
+use POE::Kernel;
+use POE::Session;
 use Getopt::Std;
 use Term::ReadKey;		# read without echoing; GetTerminalSize
 use POSIX qw(strftime);		# strftime() is used by log()
@@ -50,19 +58,32 @@ sub init($)
   my $self = shift;
   my ($columns, $lines);
 
-  $self->clear_agenda();
-  $self->set_queue('');
-  $self->clear_questions();
+  # Initialize the queues to empty.
+  $self->init_agenda();
+  $self->{'queue'} = [];
+  $self->init_questions();
 
-  initscr;			# Initialize the curses screen
-
-  $ENV{'COLUMNS'} = 0;		# Don't rely on environment variables
+  # Don't rely on environment variables for the size of the terminal.
+  $ENV{'COLUMNS'} = 0;
   $ENV{'LINES'} = 0;
-  ($columns, $lines, undef, undef) = GetTerminalSize();
-  $self->{'columns'} = $columns;
-  $self->{'lines'} = $lines;
+
+  # Initialize the curses screen.
+  initscr;
 
   return 1;
+}
+
+
+# window_resize_state -- handle the event after a SIGWINCH signal
+sub window_resize_state
+{
+  my ($self) = @_;
+  my ($columns, $lines);
+
+  $self->log("window_resize_state");
+  ($columns, $lines, undef, undef) = GetTerminalSize();
+  resizeterm($lines, $columns); # Tell curses to update its data structures
+  $self->output('all');		# Redraw the screen
 }
 
 
@@ -100,13 +121,16 @@ sub output($$)
   my ($self, $which) = @_;
   my ($y, $col2, $col3, $columns, $lines);
 
+  # Install a signal handler for SIGWINCH, if not yet done.
+  if (!$self->{'window_resize installed'}) {
+    $self->log("Install SIGWINCH handler");
+    $poe_kernel->sig('WINCH', 'window_resize');
+    $poe_kernel->state('window_resize', $self, 'window_resize_state');
+    $self->{'window_resize installed'} = 1;
+  }
+
   # Calculate the size of the columns.
   ($columns, $lines, undef, undef) = GetTerminalSize();
-  if ($self->{'columns'} != $columns || $self->{'lines'} != $lines) {
-    $self->{'columns'} = $columns;
-    $self->{'lines'} = $lines;
-    resizeterm($lines, $columns); # Tell curses to update its data structures
-  }
   $col2 = int($columns/2);
   $col3 = int(3 * $columns / 5);
 
@@ -215,8 +239,8 @@ sub delete_agendum($$)
 }
 
 
-# clear_agenda -- empty the agenda
-sub clear_agenda($)
+# init_agenda -- empty the agenda
+sub init_agenda($)
 {
   my ($self) = @_;
 
@@ -224,6 +248,15 @@ sub clear_agenda($)
   $self->{'agenda_order'} = [];    # List of numbers of agenda items
   $self->{'agenda_is_open'} = [0]; # List of booleans, 0 means item is closed
   $self->{'current_agendum'} = 0;  # Last opened agenda item, or 0 if none
+}
+
+
+# clear_agenda -- empty the agenda and display it
+sub clear_agenda($)
+{
+  my ($self) = @_;
+
+  $self->init_agenda();
   $self->output('agenda');
   return undef;
 }
@@ -357,28 +390,25 @@ sub set_question($$$$)
 }
 
 
-# clear_questions -- clear the list of questions
-sub clear_questions($)
+# init_questions -- clear the list of questions
+sub init_questions($)
 {
   my ($self) = @_;
 
   $self->{'questions'} = ['Unusued question 0'];
   $self->{'questions_supporters'} = [{}];
-  $self->output('questions');
-  return undef;
 }
 
 
-# # chanjoin -- called when somebody joins a channel
-# sub chanjoin($$)
-# {
-#   my ($self, $info) = @_;
-#   my $who = $info->{'who'};
-#   my $channel = $info->{'channel'};
-#   # my $raw_nick = $info->{'raw_nick'};
-#   # my $body = $info->{'body'};
-#   # my $address = $info->{'address'};
-# }
+# clear_questions -- clear the list of questions and display it
+sub clear_questions($)
+{
+  my ($self) = @_;
+
+  $self->init_questions();
+  $self->output('questions');
+  return undef;
+}
 
 
 # help -- return the text in response to "zakim-monitor, help"
@@ -392,6 +422,16 @@ sub help($$)
 }
 
 
+# sub quit($)
+# {
+#   my ($self, $info) = @_;
+#   my $channel = $info->{'channel'};	# "#channel" or "msg"
+
+#   $self->part_channel($channel);
+#   $self->shutdown('Quit');
+# }
+
+
 # said -- handle a message
 sub said($$)
 {
@@ -400,7 +440,7 @@ sub said($$)
   my $text = $info->{'body'};		# What nick said
   my $channel = $info->{'channel'};	# "#channel" or "msg"
   # my $me = $self->nick();		# Our own name
-  # my $addressed = $info->{'address'};	# Defined if we're personally addressed
+  my $addressed = $info->{'address'};	# Defined if we're personally addressed
 
   # We only handle channels we explicitly joined. We don't handle
   # private messages (channel 'msg') or messages on other channels
@@ -476,6 +516,9 @@ sub said($$)
   return $self->set_question($1, $2, $3)
       if $who =~ /^zakim$/i &&
       $text =~ /^Q(\d+): (.*) \((\d+) supporters?\)$/;
+
+  # return $self->quit($info)
+  #     if $addressed && $text =~ /^\s*bye\s*$/i;
 
   # $self->log("<$who> $text");
   return $self->SUPER::said($info);
