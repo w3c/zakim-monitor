@@ -495,11 +495,11 @@ sub said($$)
 
   # Question tracking.
 
-  return $self->add_question($who, $1)
-      if $text =~ /^\s*ques(?:tion|t)?\s*\+([^+].*)/i;
-
   return $self->support_question($who, $1 // $2)
       if $text =~ /^\s*ques(?:tion|t)?\s*(?:\+\+\s*(\d+)|(\d+)\s*\+\+)\s*$/i;
+
+  return $self->add_question($who, $1)
+      if $text =~ /^\s*ques(?:tion|t)?\s*\+\+?(.*\S.*)/i;
 
   return $self->unsupport_question($who, $1 // $2)
       if $text =~ /^\s*ques(?:tion|t)?\s*(?:--\s*(\d+)|(\d+)\s*--)\s*$/i;
@@ -511,7 +511,7 @@ sub said($$)
 
   return $self->drop_question($1)
       if $who =~ /^zakim$/i &&
-         $text =~ /^(?:notes )?question (\d+).* dropped$/;
+         $text =~ /^(?:notes )?question (\d+).* (dropped|closed)$/;
 
   return $self->set_question($1, $2, $3)
       if $who =~ /^zakim$/i &&
