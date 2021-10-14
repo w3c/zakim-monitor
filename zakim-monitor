@@ -172,7 +172,8 @@ sub output($$)
   foreach (@order) {		# Print in order, omit dropped questions
     if ($score[$_] >= 0) {
       $self->addstr_hellip($y++, $col3,
-	sprintf(" Q%d: %s (%d)",$_,$self->{'questions'}[$_],$score[$_]),
+	sprintf(" Q%d [%s] %s (%d)", $_, $self->{'questions_authors'}[$_],
+	  $self->{'questions'}[$_], $score[$_]),
 	$columns - $col3);
     }
   }
@@ -331,6 +332,7 @@ sub add_question($$$)
   $question =~ s/^\s+//;	# Trim leading white space
   $question =~ s/\s+$//;	# Trim trailing white space
   push @{$self->{'questions'}}, $question;
+  push @{$self->{'questions_authors'}}, $who;
   push @{$self->{'questions_supporters'}}, {$who => 1};
   $self->output('questions');
   return undef;
@@ -396,6 +398,7 @@ sub init_questions($)
   my ($self) = @_;
 
   $self->{'questions'} = ['Unusued question 0'];
+  $self->{'questions_authors'} = ['Unusued question 0'];
   $self->{'questions_supporters'} = [{}];
 }
 
