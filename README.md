@@ -14,7 +14,7 @@ Run it with a command such as this:
 The full manual is contained in the program file. Use `perlpod zakim-monitor` to read a formatted version.
 
 ## Installation
-The program requires Perl and the following Perl modules to be installed:
+The [program](zakim-monitor) requires Perl and the following Perl modules to be installed:
 * [Bot::BasicBot](https://metacpan.org/pod/Bot::BasicBot) (in Debian: libbot-basicbot-perl)
 * [Curses](https://metacpan.org/pod/Curses) (in Debian: libcurses-perl)
 * [Term::ReadKey](https://metacpan.org/pod/Term::ReadKey) (in Debian: libterm-readkey-perl)
