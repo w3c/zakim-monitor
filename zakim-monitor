@@ -1,4 +1,4 @@
-#!/usr/bin/env perl						# -*-perl-*-
+#!/usr/bin/env -S perl						# -*-perl-*-
 #
 # An IRC client that connects to a channel, watches the interaction
 # with Zakim[1], and continuously displays on standard output the
