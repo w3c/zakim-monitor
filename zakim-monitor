@@ -46,10 +46,15 @@ use Getopt::Std;
 use Term::ReadKey;		# read without echoing; GetTerminalSize
 use POSIX qw(strftime);		# strftime() is used by log()
 use Curses;
+use Net::Netrc;
 
 use constant VERSION => '0.1';
 use constant HOME => 'https://github.com/w3c/zakim-monitor';
 use constant USAGE => "Usage: $0 [-v] [-n nick] [-N name] IRC-URL\n";
+
+use constant AGENDA => 1;	# Bit 3: Show the agenda (column 1)
+use constant QUEUE => 2;	# Bit 2: Show the queue in (column 2)
+use constant QUESTIONS => 4;	# Bit 1: Show the questions (column 3)
 
 
 # init -- initialize some parameters
@@ -131,8 +136,15 @@ sub output($$)
 
   # Calculate the size of the columns.
   ($columns, $lines, undef, undef) = GetTerminalSize();
-  $col2 = int($columns/2);
-  $col3 = int(3 * $columns / 5);
+  for ($self->{columns}) {
+    if ($_ == QUESTIONS) { $col2 = $col3 = 0 }
+    elsif ($_ == QUEUE) { $col2 = 0; $col3 = $columns }
+    elsif ($_ == QUEUE + QUESTIONS) { $col2 = 0; $col3 = int($columns/5) }
+    elsif ($_ == AGENDA) { $col2 = $col3 = $columns }
+    elsif ($_ == AGENDA + QUESTIONS) { $col2 = $col3 = int($columns/2) }
+    elsif ($_ == AGENDA + QUEUE) { $col2 = int(4*$columns/5); $col3 = $columns }
+    else { $col2 = int($columns/2); $col3 = int(3*$columns/5) }
+  }
 
   # TODO: Can this be made more efficient by redrawing just the part
   # indicated by $which?
@@ -141,40 +153,46 @@ sub output($$)
   erase();
 
   # Draw the first column: the agenda.
-  $y = 0;
-  $self->addstr_hellip($y++, 0, "AGENDA", $col2);
-  $self->addstr_hellip($y++, 0, "------", $col2);
-  foreach my $i (@{$self->{'agenda_order'}}) {
-    if ($self->{'agenda_is_open'}[$i]) {
-      $self->addstr_hellip($y++, 0,
-	sprintf("%d. %s", $i, $self->{'agenda'}[$i]), $col2);
+  if ($self->{columns} & AGENDA) {
+    $y = 0;
+    $self->addstr_hellip($y++, 0, "AGENDA", $col2);
+    $self->addstr_hellip($y++, 0, "------", $col2);
+    foreach my $i (@{$self->{'agenda_order'}}) {
+      if ($self->{'agenda_is_open'}[$i]) {
+	$self->addstr_hellip($y++, 0,
+	  sprintf("%d. %s", $i, $self->{'agenda'}[$i]), $col2);
+      }
     }
   }
 
   # Draw the second column: the speaker queue.
-  $y = 0;
-  $self->addstr_hellip($y++, $col2, " QUEUE", $col3 - $col2);
-  $self->addstr_hellip($y++, $col2, " -----", $col3 - $col2);
-  $self->addstr_hellip($y++, $col2, " $_", $col3 - $col2)
-      foreach @{$self->{'queue'}};
+  if ($self->{columns} & QUEUE) {
+    $y = 0;
+    $self->addstr_hellip($y++, $col2, " QUEUE", $col3 - $col2);
+    $self->addstr_hellip($y++, $col2, " -----", $col3 - $col2);
+    $self->addstr_hellip($y++, $col2, " $_", $col3 - $col2)
+	foreach @{$self->{'queue'}};
+  }
 
   # Draw the third column: the list of questions.
-  my @score = [-1];	      # Number of supporters for each question
-  foreach (1 .. $#{$self->{'questions'}}) {
-    push @score,
+  if ($self->{columns} & QUESTIONS) {
+    my @score = [-1];	      # Number of supporters for each question
+    foreach (1 .. $#{$self->{'questions'}}) {
+      push @score,
 	!defined $self->{'questions'}[$_] ? -1 : # Dropped question
 	scalar %{$self->{'questions_supporters'}[$_]};
-  }
-  $y = 0;
-  $self->addstr_hellip($y++, $col3, " QUESTIONS", $columns - $col3);
-  $self->addstr_hellip($y++, $col3, " ---------", $columns - $col3);
-  my @order = sort {$score[$b] <=> $score[$a]} (1..$#{$self->{'questions'}});
-  foreach (@order) {		# Print in order, omit dropped questions
-    if ($score[$_] >= 0) {
-      $self->addstr_hellip($y++, $col3,
-	sprintf(" Q%d [%s] %s (%d)", $_, $self->{'questions_authors'}[$_],
-	  $self->{'questions'}[$_], $score[$_]),
-	$columns - $col3);
+    }
+    $y = 0;
+    $self->addstr_hellip($y++, $col3, " QUESTIONS", $columns - $col3);
+    $self->addstr_hellip($y++, $col3, " ---------", $columns - $col3);
+    my @order = sort {$score[$b] <=> $score[$a]} (1..$#{$self->{'questions'}});
+    foreach (@order) {		# Print in order, omit dropped questions
+      if ($score[$_] >= 0) {
+	$self->addstr_hellip($y++, $col3,
+	  sprintf(" Q%d [%s] %s (%d)", $_, $self->{'questions_authors'}[$_],
+	    $self->{'questions'}[$_], $score[$_]),
+	  $columns - $col3);
+      }
     }
   }
 
@@ -528,35 +546,75 @@ sub said($$)
 }
 
 
+# read_netrc -- find login & password for a host and (optional) login in .netrc
+sub read_netrc($;$)
+{
+  my ($host, $login) = @_;
+
+  my $machine = Net::Netrc->lookup($host, $login);
+  return ($machine->login, $machine->password) if defined $machine;
+  return (undef, undef);
+}
+
+
 # Main body
 
-my (%opts, $user, $password, $ssl, $host, $port, $channel, $nick, $name);
+my (%opts, $proto, $user, $password, $ssl, $host, $port, $channel, $nick,
+    $name, $ipv6, $columns);
 
-getopts('n:N:v', \%opts) or die USAGE;
+getopts('n:N:v123', \%opts) or die USAGE;
 die USAGE if $#ARGV != 0;
 
 # The single argument must be an IRC-URL.
 #
-$ARGV[0] =~ m/^(ircs?):\/\/(?:([^:]+):([^@]+)?@)?([^:\/#?]+)(?::([^\/]*))?(?:\/(.*))?$/i or
+($proto, $user, $password, $host, $ipv6, $port, $channel) = $ARGV[0] =~
+    m{^
+      (ircs?)://				# protocol://
+      (?:([^:@/?#]+)(?::([^@/?#]+)?)?@)?	# user:password@
+      (?:([^:/?#[]+)|\[([0-9a-f:]+)\])		# host or IPv6 address
+      (?::([^/?#]+))?				# :port
+      (?:/(.+)?)?				# /channel
+      $}xi or
     die "Argument must be a URI starting with `irc:' or `ircs:'\n";
-$ssl = $1 eq 'ircs';
-$user = $2 =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/egr if defined $2;
-$password = $3 =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/egr if defined $3;
-$host = $4;
-$port = $5 // ($ssl ? 6697 : 6667);
-$channel = $6 =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/egr if defined $6;
+
+$ssl = $proto =~ /ircs$/i;
+$user =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg if defined $user;
+$password =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg if defined $password;
+$host =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg if defined $host;
+$host //= $ipv6;
+$port //= $ssl ? 6697 : 6667;
+$channel =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg if defined $channel;
 $channel = '#' . $channel if defined $channel && $channel !~ /^[#&]/;
 
-$nick = $opts{'n'} // ($user ? "$user-zakim-monitor" : "zakim-monitor");
-$name = $opts{'N'} // ('Zakim Monitor '.VERSION.' ('.HOME.')');
+# If there was no username, or if there was a username, but no
+# password, try to find them in ~/.netrc
+if (!defined $user) {
+  my ($u, $p) = read_netrc($host);
+  ($user, $password) = ($u, $p) if defined $u;
+} elsif (defined $user && !defined $password) {
+  my ($u, $p) = read_netrc($host, $user);
+  $password = $p if defined $p;
+}
 
+# If we have a username, but still no password, prompt for it.
 if (defined $user && !defined $password) {
   print "IRC password for user \"$user\": ";
   ReadMode('noecho');
   $password = ReadLine(0);
   ReadMode('restore');
   print "\n";
+  chomp $password;
 }
+
+$nick = $opts{'n'} // ($user ? "$user-zakim-monitor" : "zakim-monitor");
+$name = $opts{'N'} // ('Zakim Monitor '.VERSION.' ('.HOME.')');
+
+# Options -1, -2 and -3 suppress columns from the output.
+$columns = AGENDA + QUEUE + QUESTIONS;
+$columns -= AGENDA if defined $opts{'1'};
+$columns -= QUEUE if defined $opts{'2'};
+$columns -= QUESTIONS if defined $opts{'3'};
+die "You cannot omit all three columns (-1, -2 and -3)\n" if $columns == 0;
 
 my $bot = ZakimMonitor->new(
   server => $host,
@@ -568,6 +626,7 @@ my $bot = ZakimMonitor->new(
   nick => $nick,
   name => $name,
   channels => (defined $channel ? [$channel] : []),
+  columns => $columns,
   verbose => defined $opts{'v'});
 
 $bot->run();
@@ -575,7 +634,7 @@ $bot->run();
 
 =head1 NAME
 
-zakim-monitor [-v] [-n I<nick>] [-N I<name>] I<IRC-URL>
+zakim-monitor [-v] [-n I<nick>] [-N I<name>] [-1] [-2] [-3] I<IRC-URL>
 
 =head1 DESCRIPTION
 
@@ -635,6 +694,19 @@ set a different nickname.
 By default, B<zakim-monitor> sets its "real name" to a text consisting
 of "Zakim Monitor", a version number and the URL of its online manual.
 The B<-N> option allows to set a different name.
+
+=item B<-1>
+
+Omit the agenda from the output.
+
+=item B<-2>
+
+Omit the speaker queue from the output.
+
+=item B<-3>
+
+Omit the questions from the output. It is an error to omit all three
+columns.
 
 =back
 
