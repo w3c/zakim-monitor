@@ -401,6 +401,8 @@ sub set_question($$$$)
 
   # We don't know who supports the question, so we cannot set the supporters.
   $self->{'questions_supporters'}[$n] //= {};
+  # Zakim doesn't list the author of a question.
+  $self->{'questions_authors'}[$n] //= '';
   $score = scalar %{$self->{'questions_supporters'}[$n]};
   $self->log("Q$n has $score supporters; should be $nsupporters")
       if $score != $nsupporters;
